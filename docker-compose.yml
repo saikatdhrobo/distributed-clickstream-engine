@@ -1,0 +1,215 @@
+name: distributed-clickstream-engine
+
+x-engine-environment: &engine-environment
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-clickstream.events}
+  KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-clickstream.events.dead-letter}
+  KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
+  KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
+  KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-clickstream-analytics-v1}
+  REDIS_URL: redis://redis:6379/0
+  ANALYTICS_KEY_PREFIX: ${ANALYTICS_KEY_PREFIX:-analytics}
+  BUCKET_SECONDS: ${BUCKET_SECONDS:-10}
+  SERIES_BUCKETS: ${SERIES_BUCKETS:-60}
+  ACTIVE_USER_WINDOW_SECONDS: ${ACTIVE_USER_WINDOW_SECONDS:-60}
+  BUCKET_RETENTION_SECONDS: ${BUCKET_RETENTION_SECONDS:-7200}
+  DEDUP_TTL_SECONDS: ${DEDUP_TTL_SECONDS:-86400}
+  MAX_MESSAGE_BYTES: ${MAX_MESSAGE_BYTES:-65536}
+  CURRENCY: ${CURRENCY:-USD}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    hostname: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+      ZOOKEEPER_SYNC_LIMIT: "2"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "cub zk-ready localhost 2181 5"]
+      interval: 10s
+      timeout: 7s
+      retries: 12
+      start_period: 20s
+    networks:
+      - analytics
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    hostname: kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${KAFKA_EXTERNAL_PORT:-9094}:9094"
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:${KAFKA_EXTERNAL_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_NUM_PARTITIONS: "6"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_LOG_RETENTION_HOURS: "168"
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 8s
+      retries: 15
+      start_period: 40s
+    networks:
+      - analytics
+
+  redis:
+    image: redis:7.4-alpine
+    hostname: redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:${REDIS_EXTERNAL_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      - analytics
+
+  analytics-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-clickstream-engine:local
+    command: ["python", "analytics_processor.py"]
+    restart: unless-stopped
+    init: true
+    environment: *engine-environment
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os,time,redis,sys;
+          c=redis.Redis.from_url(os.getenv('REDIS_URL','redis://redis:6379/0'));
+          v=c.get(os.getenv('ANALYTICS_KEY_PREFIX','analytics')+':processor:heartbeat');
+          sys.exit(0 if v and time.time()-float(v)<30 else 1)
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 25s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - analytics
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: distributed-clickstream-engine:local
+    command:
+      - gunicorn
+      - --worker-class
+      - geventwebsocket.gunicorn.workers.GeventWebSocketWorker
+      - --workers
+      - "1"
+      - --bind
+      - 0.0.0.0:5000
+      - --access-logfile
+      - -
+      - --error-logfile
+      - -
+      - --timeout
+      - "120"
+      - app:app
+    restart: unless-stopped
+    init: true
+    environment:
+      <<: *engine-environment
+      SERIES_BUCKETS: ${SERIES_BUCKETS:-60}
+      BROADCAST_INTERVAL_SECONDS: ${BROADCAST_INTERVAL_SECONDS:-1}
+      SOCKETIO_ASYNC_MODE: ${SOCKETIO_ASYNC_MODE:-gevent}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-}
+      START_BROADCASTER: "true"
+    depends_on:
+      redis:
+        condition: service_healthy
+      analytics-processor:
+        condition: service_healthy
+    ports:
+      - "${APP_HOST_BIND:-127.0.0.1}:${APP_PORT:-5000}:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:5000/health/live',timeout=3).read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 25s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - analytics
+
+  traffic-generator:
+    image: distributed-clickstream-engine:local
+    profiles: ["tools"]
+    command: ["python", "traffic_generator.py"]
+    restart: "no"
+    init: true
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-clickstream.events}
+      SIMULATED_USERS: ${SIMULATED_USERS:-1000}
+      TRAFFIC_THREADS: ${TRAFFIC_THREADS:-1000}
+      EVENT_INTERVAL_SECONDS: ${EVENT_INTERVAL_SECONDS:-1}
+      RUN_DURATION_SECONDS: ${RUN_DURATION_SECONDS:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - analytics
+
+networks:
+  analytics:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  redis-data:

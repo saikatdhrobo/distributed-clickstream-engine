@@ -1,0 +1,45 @@
+# Python bytecode and runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments and local Python tooling
+.venv/
+venv/
+env/
+ENV/
+.python-version
+.tox/
+.nox/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment variables / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs, temporary files, and generated data
+*.log
+*.pid
+*.tmp
+.DS_Store
+logs/
+data/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Node/browser tooling (not required by this vanilla-JS project)
+node_modules/

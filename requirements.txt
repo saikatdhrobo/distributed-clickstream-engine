@@ -1,0 +1,12 @@
+# Web API and event-driven WebSocket server
+Flask>=3.0,<4.0
+Flask-SocketIO>=5.3,<6.0
+
+# Kafka client and Redis client
+confluent-kafka>=2.3,<3.0
+redis>=5.0,<7.0
+
+# Production WSGI server with WebSocket support
+gevent>=24.2,<26.0
+gevent-websocket>=0.10.1,<1.0
+gunicorn>=21.2,<24.0
